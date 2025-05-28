@@ -1,3 +1,5 @@
+# !! THIS ISNT FINISHED.. DO NOT USE IT !!
+
 # Reddit Saved Downloader
 
 [![GitHub](https://img.shields.io/github/license/M1noa/reddit-saved-downloader)](https://github.com/M1noa/reddit-saved-downloader)
