@@ -1,5 +1,9 @@
-Zaiohttp
-aiofiles
-tqdm
+requests
 rich
 colorama
+yt-dlp
+aiohttp
+cloudscraper
+# Optional dependencies for enhanced Cloudflare bypass
+undetected-chromedriver
+selenium
