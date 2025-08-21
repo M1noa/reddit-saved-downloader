@@ -11,6 +11,8 @@ import aiofiles
 import logging
 import yt_dlp
 import cloudscraper
+import random
+import signal
 try:
     import undetected_chromedriver as uc
     from selenium.webdriver.common.by import By
@@ -29,14 +31,17 @@ from typing import List, Dict, Any
 console = Console()
 
 class RedditMediaDownloader:
-    def __init__(self, output_dir: str, max_concurrent: int = 5, filename_style: str = 'basic', log_file: str = None):
+    def __init__(self, output_dir: str, max_concurrent: int = 5, filename_style: str = 'basic', log_file: str = None, debug: bool = False):
         self.output_dir = os.path.abspath(output_dir)
         os.makedirs(self.output_dir, exist_ok=True)  # Create output directory if it doesn't exist
         self.max_concurrent = max_concurrent
         self.filename_style = filename_style
         self.session = None
         self.processed_urls = set()  # Track processed URLs
+        self.processed_posts = set()  # Track processed post IDs to prevent duplicates
         self.download_semaphore = None  # Control concurrent downloads
+        self.max_retries = 3  # Maximum retry attempts for failed downloads
+        self.base_delay = 1  # Base delay for exponential backoff
         
         # Create log file directory if specified
         if log_file:
@@ -54,9 +59,10 @@ class RedditMediaDownloader:
         
         # Setup logging with simplified format
         log_format = "%(levelname)s - %(message)s"
+        log_level = logging.DEBUG if debug else logging.INFO
         if log_file:
             logging.basicConfig(
-                level=logging.INFO,
+                level=log_level,
                 format=log_format,
                 handlers=[
                     RichHandler(console=console, rich_tracebacks=True, show_path=False),
@@ -65,7 +71,7 @@ class RedditMediaDownloader:
             )
         else:
             logging.basicConfig(
-                level=logging.INFO,
+                level=log_level,
                 format=log_format,
                 handlers=[RichHandler(console=console, rich_tracebacks=True, show_path=False)]
             )
@@ -429,13 +435,29 @@ class RedditMediaDownloader:
 
         return os.path.join(self.output_dir, filename) if file_ext else ''
 
-    async def _download_file(self, url: str, filename: str, task_id) -> bool:
+    def _file_exists_and_valid(self, filepath):
+        """Check if file exists and has valid size (not empty or corrupted)"""
+        if not os.path.exists(filepath):
+            return False
+        
+        # Check if file size is reasonable (> 1KB for most media files)
+        try:
+            file_size = os.path.getsize(filepath)
+            if file_size < 1024:  # Less than 1KB might be corrupted
+                logging.debug(f"File {filepath} exists but is too small ({file_size} bytes), will re-download")
+                return False
+            return True
+        except OSError:
+            return False
+
+    async def _download_file_with_retry(self, url: str, filename: str, task_id, retry_count: int = 0) -> bool:
+        """Download file with retry logic and exponential backoff"""
         if url in self.processed_urls:
             logging.info(f"⏩ Already processed: {os.path.basename(filename)}")
             self.progress.update(task_id, advance=1)
             return True
 
-        if os.path.exists(filename):
+        if self._file_exists_and_valid(filename):
             self.processed_urls.add(url)
             logging.info(f"⏩ Skipped: {os.path.basename(filename)}")
             self.progress.update(task_id, advance=1)
@@ -453,14 +475,34 @@ class RedditMediaDownloader:
                         logging.info(f"✓ Downloaded: {os.path.basename(filename)}")
                         self.progress.update(task_id, advance=1)
                         return True
+                    elif response.status == 429:  # Rate limited
+                        if retry_count < self.max_retries:
+                            delay = self.base_delay * (2 ** retry_count) + random.uniform(0, 1)
+                            logging.warning(f"⏳ Rate limited, retrying in {delay:.1f}s: {os.path.basename(filename)} (attempt {retry_count + 1}/{self.max_retries})")
+                            await asyncio.sleep(delay)
+                            return await self._download_file_with_retry(url, filename, task_id, retry_count + 1)
+                        else:
+                            logging.error(f"✗ Failed after {self.max_retries} retries: {os.path.basename(filename)} (Status 429)")
+                            self.progress.update(task_id, advance=1)
+                            return False
                     else:
                         logging.error(f"✗ Failed: {os.path.basename(filename)} (Status {response.status})")
                         self.progress.update(task_id, advance=1)
                         return False
             except Exception as e:
-                logging.error(f"✗ Error: {os.path.basename(filename)} ({str(e)})")
-                self.progress.update(task_id, advance=1)
-                return False
+                if retry_count < self.max_retries:
+                    delay = self.base_delay * (2 ** retry_count) + random.uniform(0, 1)
+                    logging.warning(f"⏳ Error, retrying in {delay:.1f}s: {os.path.basename(filename)} - {str(e)} (attempt {retry_count + 1}/{self.max_retries})")
+                    await asyncio.sleep(delay)
+                    return await self._download_file_with_retry(url, filename, task_id, retry_count + 1)
+                else:
+                    logging.error(f"✗ Error after {self.max_retries} retries: {os.path.basename(filename)} ({str(e)})")
+                    self.progress.update(task_id, advance=1)
+                    return False
+
+    async def _download_file(self, url: str, filename: str, task_id) -> bool:
+        """Wrapper for download with retry logic"""
+        return await self._download_file_with_retry(url, filename, task_id)
 
     def _cleanup_incomplete_downloads(self):
         for filename in os.listdir(self.output_dir):
@@ -472,10 +514,36 @@ class RedditMediaDownloader:
                 except Exception as e:
                     logging.error(f"Failed to clean up {filename}: {str(e)}")
 
+    def _load_processed_posts(self) -> set:
+        """Load previously processed post IDs from file"""
+        processed_file = os.path.join(self.output_dir, '.processed_posts.json')
+        if os.path.exists(processed_file):
+            try:
+                with open(processed_file, 'r') as f:
+                    return set(json.load(f))
+            except Exception as e:
+                logging.warning(f"Could not load processed posts file: {e}")
+        return set()
+    
+    def _save_processed_posts(self):
+        """Save processed post IDs to file"""
+        processed_file = os.path.join(self.output_dir, '.processed_posts.json')
+        try:
+            with open(processed_file, 'w') as f:
+                json.dump(list(self.processed_posts), f)
+        except Exception as e:
+            logging.warning(f"Could not save processed posts file: {e}")
+    
     async def process_posts(self, saved_data):
         os.makedirs(self.output_dir, exist_ok=True)
+        
+        # Load previously processed posts
+        self.processed_posts = self._load_processed_posts()
+        
         tasks = []
         total_urls = 0
+        new_posts_count = 0
+        skipped_posts_count = 0
         
         # Handle both list and dict formats for saved_data
         if isinstance(saved_data, list):
@@ -489,16 +557,37 @@ class RedditMediaDownloader:
         # Get posts in reverse order (newest first)
         posts.reverse()
         
-        # Count total URLs first
+        # Filter out already processed posts and count URLs
+        filtered_posts = []
         for post in posts:
             if 'data' in post:
-                urls = self._get_media_urls(post['data'])
-                total_urls += len(urls)
+                post_data = post['data']
+                post_id = post_data.get('id')
+                
+                if post_id in self.processed_posts:
+                    skipped_posts_count += 1
+                    continue
+                
+                urls = self._get_media_urls(post_data)
+                if urls:  # Only process posts with media
+                    filtered_posts.append(post)
+                    total_urls += len(urls)
+                    new_posts_count += 1
+                    self.processed_posts.add(post_id)  # Mark as processed
+        
+        if skipped_posts_count > 0:
+            logging.info(f"⏩ Skipped {skipped_posts_count} already processed posts")
+        
+        if new_posts_count == 0:
+            logging.info("ℹ️ No new posts with media to download")
+            return
+        
+        logging.info(f"📥 Processing {new_posts_count} new posts with {total_urls} media files")
         
         with self.progress:
             task_id = self.progress.add_task("[dim cyan]⬇️  Downloading media", total=total_urls)
             
-            for post in posts:
+            for post in filtered_posts:
                 if 'data' in post:
                     post_data = post['data']
                     urls = self._get_media_urls(post_data)
@@ -522,6 +611,9 @@ class RedditMediaDownloader:
             
             # Process all downloads concurrently with semaphore control
             await asyncio.gather(*tasks)
+            
+            # Save processed posts to file
+            self._save_processed_posts()
 
     async def _get_redgifs_token(self) -> str:
         async with self.session.get('https://api.redgifs.com/v2/auth/temporary') as response:
@@ -578,40 +670,104 @@ class RedditMediaDownloader:
             self.progress.update(task_id, advance=1)
             return False
 
-    async def _download_reddit_video(self, url: str, filename: str, task_id) -> bool:
-        """Download Reddit video using yt-dlp"""
-        try:
-            # Configure yt-dlp options
-            ydl_opts = {
-                'outtmpl': os.path.join(self.output_dir, filename),
-                'quiet': True,
-                'no_warnings': True,
-                'format': 'best[height<=720]/best',  # Prefer 720p or lower, fallback to best available
-                'ignoreerrors': False,
-                'extract_flat': False,
-            }
-            
-            # Use yt-dlp to download the video
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                await asyncio.get_event_loop().run_in_executor(
-                    None, ydl.download, [url]
-                )
-            
-            # Check if file was downloaded successfully
-            filepath = os.path.join(self.output_dir, filename)
-            if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
-                logging.info(f"✓ Downloaded: {os.path.basename(filename)}")
-                self.progress.update(task_id, advance=1)
-                return True
-            else:
-                logging.error(f"✗ Download failed: {os.path.basename(filename)}")
-                self.progress.update(task_id, advance=1)
-                return False
-                
-        except Exception as e:
-            logging.error(f"✗ Reddit Video Error: {os.path.basename(filename)} ({str(e)})")
+    async def _download_reddit_video_with_retry(self, url: str, filename: str, task_id, retry_count: int = 0) -> bool:
+        """Download Reddit video using yt-dlp with format fallback and retry logic"""
+        filepath = os.path.join(self.output_dir, filename)
+        
+        # Check if already exists
+        if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+            logging.info(f"⏩ Skipped: {os.path.basename(filename)}")
             self.progress.update(task_id, advance=1)
-            return False
+            return True
+        
+        # Define format options in order of preference
+        format_options = [
+            'best[height<=720]/best',  # Prefer 720p or lower
+            'best[height<=480]/best',  # Fallback to 480p
+            'worst/best',              # Fallback to worst quality
+            'best',                    # Final fallback
+        ]
+        
+        for format_idx, format_selector in enumerate(format_options):
+            try:
+                # Configure yt-dlp options
+                # Configure yt-dlp options with debug info
+                ydl_opts = {
+                    'outtmpl': filepath,
+                    'quiet': not logging.getLogger().isEnabledFor(logging.DEBUG),
+                    'no_warnings': not logging.getLogger().isEnabledFor(logging.DEBUG),
+                    'verbose': logging.getLogger().isEnabledFor(logging.DEBUG),
+                    'format': format_selector,
+                    'ignoreerrors': False,
+                    'extractaudio': False,
+                    'retries': 2,
+                    'fragment_retries': 2,
+                    'logger': logging.getLogger('yt-dlp'),
+                    'listformats': logging.getLogger().isEnabledFor(logging.DEBUG),  # List available formats in debug mode
+                }
+                
+                logging.debug(f"yt-dlp attempting download with format: {format_selector}")
+                logging.debug(f"yt-dlp options: {ydl_opts}")
+                
+                # Use yt-dlp to download the video
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, ydl.download, [url]
+                    )
+                
+                # Check if file was downloaded successfully
+                if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                    logging.info(f"✓ Downloaded: {os.path.basename(filename)} (format: {format_selector})")
+                    self.progress.update(task_id, advance=1)
+                    return True
+                    
+            except yt_dlp.DownloadError as e:
+                error_msg = str(e).lower()
+                if 'requested format is not available' in error_msg or 'no video formats found' in error_msg:
+                    if format_idx < len(format_options) - 1:
+                        logging.warning(f"⚠️ Format '{format_selector}' not available for {os.path.basename(filename)}, trying next format...")
+                        continue
+                    else:
+                        logging.error(f"✗ No available formats for: {os.path.basename(filename)}")
+                        self.progress.update(task_id, advance=1)
+                        return False
+                elif '429' in error_msg or 'rate limit' in error_msg:
+                    if retry_count < self.max_retries:
+                        delay = self.base_delay * (2 ** retry_count) + random.uniform(0, 1)
+                        logging.warning(f"⏳ Rate limited, retrying in {delay:.1f}s: {os.path.basename(filename)} (attempt {retry_count + 1}/{self.max_retries})")
+                        await asyncio.sleep(delay)
+                        return await self._download_reddit_video_with_retry(url, filename, task_id, retry_count + 1)
+                    else:
+                        logging.error(f"✗ Rate limited after {self.max_retries} retries: {os.path.basename(filename)}")
+                        self.progress.update(task_id, advance=1)
+                        return False
+                else:
+                    logging.error(f"✗ yt-dlp error: {os.path.basename(filename)} - {str(e)}")
+                    if format_idx < len(format_options) - 1:
+                        continue
+                    else:
+                        self.progress.update(task_id, advance=1)
+                        return False
+                        
+            except Exception as e:
+                if retry_count < self.max_retries:
+                    delay = self.base_delay * (2 ** retry_count) + random.uniform(0, 1)
+                    logging.warning(f"⏳ Error, retrying in {delay:.1f}s: {os.path.basename(filename)} - {str(e)} (attempt {retry_count + 1}/{self.max_retries})")
+                    await asyncio.sleep(delay)
+                    return await self._download_reddit_video_with_retry(url, filename, task_id, retry_count + 1)
+                else:
+                    logging.error(f"✗ Reddit Video Error after {self.max_retries} retries: {os.path.basename(filename)} ({str(e)})")
+                    self.progress.update(task_id, advance=1)
+                    return False
+        
+        # If we get here, all formats failed
+        logging.error(f"✗ All format options failed for: {os.path.basename(filename)}")
+        self.progress.update(task_id, advance=1)
+        return False
+
+    async def _download_reddit_video(self, url: str, filename: str, task_id) -> bool:
+        """Wrapper for Reddit video download with retry logic"""
+        return await self._download_reddit_video_with_retry(url, filename, task_id)
 
 def show_help():
     console.print("\n[bold cyan]Reddit Saved Downloader[/bold cyan] 🎥")
@@ -632,13 +788,36 @@ def show_help():
     console.print("python reddit_saved_downloader.py -i saved.json -o ./downloads --concurrent 10 -s advanced")
     console.print("python reddit_saved_downloader.py -r eyJhbGc6... -t eyJhbGc6... -o ./downloads\n")
 
+# Global variable to track if shutdown is in progress
+shutdown_in_progress = False
+
 def signal_handler(sig, frame):
-    console.print("\n[yellow]Received interrupt signal. Cleaning up...[/yellow]")
+    global shutdown_in_progress
+    if shutdown_in_progress:
+        console.print("\n[red]Force quit! Exiting immediately...[/red]")
+        os._exit(1)
+    
+    shutdown_in_progress = True
+    console.print("\n[yellow]Received interrupt signal (Ctrl+C). Gracefully shutting down...[/yellow]")
+    console.print("[dim]Press Ctrl+C again to force quit[/dim]")
+    
+    # Set a timer for force quit if graceful shutdown takes too long
+    import threading
+    def force_quit():
+        import time
+        time.sleep(5)  # Wait 5 seconds for graceful shutdown
+        if shutdown_in_progress:
+            console.print("\n[red]Graceful shutdown timed out. Force quitting...[/red]")
+            os._exit(1)
+    
+    threading.Thread(target=force_quit, daemon=True).start()
     sys.exit(0)
 
 def main():
     import signal
     signal.signal(signal.SIGINT, signal_handler)
+    if hasattr(signal, 'SIGTERM'):
+        signal.signal(signal.SIGTERM, signal_handler)
     
     if len(sys.argv) == 1:
         show_help()
@@ -666,6 +845,7 @@ def main():
     parser.add_argument('--style', '-s', choices=['basic', 'pretty', 'advanced'],
                       default='basic', help='Filename style (basic: title-id, pretty: title, advanced: title-id-hash)')
     parser.add_argument('--log', '-l', help='Path to log file')
+    parser.add_argument('--debug', '-d', action='store_true', help='Enable debug logging for troubleshooting')
 
     args = parser.parse_args()
 
@@ -713,7 +893,7 @@ def main():
         
         cookies_string = "; ".join(cookie_parts)
         
-    downloader = RedditMediaDownloader(args.output, args.concurrent, args.style, args.log)
+    downloader = RedditMediaDownloader(args.output, args.concurrent, args.style, args.log, args.debug)
     
     async def run():
         await downloader.init_session()
